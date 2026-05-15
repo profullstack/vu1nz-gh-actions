@@ -1,0 +1,222 @@
+# 🔐 vu1nz Actions Security Scan — Reusable GitHub Action
+#
+# Usage in your workflow:
+#
+#   jobs:
+#     scan-actions:
+#       runs-on: ubuntu-latest
+#       steps:
+#         - uses: profullstack/vu1nz-gh-actions/.github/actions/vu1nz-actions-scan@v1
+#           with:
+#             token: $
+{{ secrets.GITHUB_TOKEN }}
+#
+#   With Claude AI code review (requires ANTHROPIC_API_KEY secret):
+#         - uses: profullstack/vu1nz-gh-actions/.github/actions/vu1nz-actions-scan@v1
+#           with:
+#             token: $
+{{ secrets.GITHUB_TOKEN }}
+#             claude_api_key: $
+{{ secrets.ANTHROPIC_API_KEY }}
+
+name: "vu1nz Actions Security Scan"
+description: >
+  Scan GitHub Actions workflows for CI/CD security vulnerabilities:
+  script injection, unpinned actions, pull_request_target abuse,
+  secret leaks, permission issues, and supply chain risks.
+  Optionally runs AI-powered code review via Claude.
+
+inputs:
+  token:
+    description: "GitHub token for API access (defaults to auto-generated GITHUB_TOKEN)"
+    required: false
+    default: $
+{{ github.token }}
+
+  claude_api_key:
+    description: "Anthropic API key for Claude AI code review (optional)"
+    required: false
+    default: ""
+
+  claude_model:
+    description: "Claude model for AI code review"
+    required: false
+    default: "claude-sonnet-4-20250514"
+
+  fail_on:
+    description: "Minimum severity to fail the workflow: none, low, medium, high, critical"
+    required: false
+    default: "high"
+
+  output_dir:
+    description: "Directory to store scan reports"
+    required: false
+    default: "vu1nz-actions-report"
+
+outputs:
+  findings_count:
+    description: "Total number of security findings detected"
+    value: $
+{{ steps.set-outputs.outputs.findings_count }}
+
+  has_high_critical:
+    description: "Whether high or critical severity findings exist"
+    value: $
+{{ steps.set-outputs.outputs.has_high_critical }}
+
+  summary:
+    description: "Markdown summary of findings by severity"
+    value: $
+{{ steps.set-outputs.outputs.summary }}
+
+  report_path:
+    description: "Path to the saved JSON report file"
+    value: $
+{{ steps.set-outputs.outputs.report_path }}
+
+runs:
+  using: "composite"
+
+  steps:
+    # ── Install vu1nz ──────────────────────────────────────────────
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install vu1nz from source
+      shell: bash
+      run: |
+        if python3 -c "from vu1nz.cli import app" 2>/dev/null; then
+          echo "vu1nz already installed, skipping"
+        else
+          REF="$
+{{ github.action_ref }}"
+          [ -z "$REF" ] && REF="main"
+          pip install --quiet \
+            httpx rich typer pyyaml \
+            "git+https://github.com/$
+{{ github.action_repository }}.git@${REF}"
+        fi
+
+    # ── Run the scan ───────────────────────────────────────────────
+    - name: Scan workflows for vulnerabilities
+      id: scan
+      shell: bash
+      continue-on-error: true
+      run: |
+        vu1nz actions scan $
+{{ github.repository }} \
+          --token "$
+{{ inputs.token }}" \
+          --output "$
+{{ inputs.output_dir }}" \
+          --json 2>&1 | tee "$
+{{ runner.temp }}/vu1nz-scan.json"
+
+    # ── Claude AI review (optional) ────────────────────────────────
+    - name: Claude AI code review
+      if: inputs.claude_api_key != ''
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: $
+{{ inputs.claude_api_key }}
+      run: |
+        vu1nz actions scan $
+{{ github.repository }} \
+          --token "$
+{{ inputs.token }}" \
+          --claude \
+          --claude-model "$
+{{ inputs.claude_model }}" \
+          --output "$
+{{ inputs.output_dir }}"
+
+    # ── Set outputs ────────────────────────────────────────────────
+    - name: Parse results and set outputs
+      id: set-outputs
+      shell: bash
+      run: |
+        python3 << 'PYEOF'
+        import json, os
+
+        scan_file = os.environ.get("RUNNER_TEMP", "") + "/vu1nz-scan.json"
+        findings = []
+        counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+
+        try:
+            with open(scan_file) as f:
+                data = json.load(f)
+            findings = data.get("findings", [])
+            for f in findings:
+                sev = f.get("severity", "").lower()
+                if sev in counts:
+                    counts[sev] += 1
+        except Exception:
+            pass
+
+        total = len(findings)
+        has_hc = counts["critical"] > 0 or counts["high"] > 0
+
+        summary_parts = [f"**vu1nz Actions Scan** — {total} total findings"]
+        for sev in ("critical", "high", "medium", "low"):
+            if counts[sev] > 0:
+                summary_parts.append(f"{sev.upper()}: {counts[sev]}")
+        summary = " | ".join(summary_parts)
+
+        with open(os.environ.get("GITHUB_OUTPUT", ""), "a") as out:
+            out.write(f"findings_count={total}\n")
+            out.write(f"has_high_critical={'true' if has_hc else 'false'}\n")
+            out.write(f"summary={summary}\n")
+
+        report_dir = "$
+{{ inputs.output_dir }}"
+        report_path = "./" + report_dir
+        try:
+            files = os.listdir(report_path)
+            report_files = sorted(f for f in files if f.endswith(".json"))
+            if report_files:
+                out.write(f"report_path={report_path}/{report_files[-1]}\n")
+        except Exception:
+            pass
+        PYEOF
+
+    # ── Fail if threshold exceeded ─────────────────────────────────
+    - name: Check findings against fail threshold
+      if: inputs.fail_on != 'none'
+      shell: bash
+      run: |
+        python3 << 'PYEOF'
+        import json, os
+
+        threshold = "$
+{{ inputs.fail_on }}".lower()
+        order = {"none": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+        threshold_num = order.get(threshold, 3)
+
+        scan_file = os.environ.get("RUNNER_TEMP", "") + "/vu1nz-scan.json"
+        try:
+            with open(scan_file) as f:
+                data = json.load(f)
+            findings = data.get("findings", [])
+            worst = max(
+                (order.get(f.get("severity", "").lower(), 0) for f in findings),
+                default=0,
+            )
+            if worst >= threshold_num:
+                print(f"::error::vu1nz found issues at or above {threshold.upper()} severity")
+                exit(1)
+            print(f"::notice::No issues at or above {threshold.upper()} severity")
+        except Exception as e:
+            print(f"::warning::Could not parse scan results: {e}")
+        PYEOF
+
+    # ── Upload report ──────────────────────────────────────────────
+    - name: Upload scan report artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: vu1nz-actions-scan-report
+        path: $
+{{ inputs.output_dir }}/
+        retention-days: 30
