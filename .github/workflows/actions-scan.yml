@@ -39,11 +39,9 @@ jobs:
       - uses: ./.github/actions/vu1nz-actions-scan
         id: scan
         with:
-          token: $
-{{ secrets.GITHUB_TOKEN }}
+          token: ${{  secrets.GITHUB_TOKEN }}
           fail_on: high
-          # claude_api_key: $
-{{ secrets.ANTHROPIC_API_KEY }}  # Uncomment to enable Claude AI review
+          # claude_api_key: ${{  secrets.ANTHROPIC_API_KEY }}  # Uncomment to enable Claude AI review
 
       # Post PR comment with findings summary
       - name: Post PR comment
@@ -51,15 +49,12 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const summary = `$
-{{ steps.scan.outputs.summary || 'vu1nz scan completed.' }}`;
+            const summary = `${{  steps.scan.outputs.summary || 'vu1nz scan completed.' }}`;
 
             let body = `## 🔐 vu1nz Actions Security Scan\n\n${summary}\n\n`;
 
-            const count = parseInt('$
-{{ steps.scan.outputs.findings_count || '0' }}');
-            const hasHC = '$
-{{ steps.scan.outputs.has_high_critical }}' === 'true';
+            const count = parseInt('${{  steps.scan.outputs.findings_count || '0' }}');
+            const hasHC = '${{  steps.scan.outputs.has_high_critical }}' === 'true';
 
             if (hasHC) {
               body += '⚠️ **High or critical findings detected — review before merging.**\n\n';

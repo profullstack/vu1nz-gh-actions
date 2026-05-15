@@ -8,16 +8,13 @@
 #       steps:
 #         - uses: profullstack/vu1nz-gh-actions/.github/actions/vu1nz-actions-scan@v1
 #           with:
-#             token: $
-{{ secrets.GITHUB_TOKEN }}
+#             token: ${{  secrets.GITHUB_TOKEN }}
 #
 #   With Claude AI code review (requires ANTHROPIC_API_KEY secret):
 #         - uses: profullstack/vu1nz-gh-actions/.github/actions/vu1nz-actions-scan@v1
 #           with:
-#             token: $
-{{ secrets.GITHUB_TOKEN }}
-#             claude_api_key: $
-{{ secrets.ANTHROPIC_API_KEY }}
+#             token: ${{  secrets.GITHUB_TOKEN }}
+#             claude_api_key: ${{  secrets.ANTHROPIC_API_KEY }}
 
 name: "vu1nz Actions Security Scan"
 description: >
@@ -30,8 +27,7 @@ inputs:
   token:
     description: "GitHub token for API access (defaults to auto-generated GITHUB_TOKEN)"
     required: false
-    default: $
-{{ github.token }}
+    default: ${{  github.token }}
 
   claude_api_key:
     description: "Anthropic API key for Claude AI code review (optional)"
@@ -56,23 +52,19 @@ inputs:
 outputs:
   findings_count:
     description: "Total number of security findings detected"
-    value: $
-{{ steps.set-outputs.outputs.findings_count }}
+    value: ${{  steps.set-outputs.outputs.findings_count }}
 
   has_high_critical:
     description: "Whether high or critical severity findings exist"
-    value: $
-{{ steps.set-outputs.outputs.has_high_critical }}
+    value: ${{  steps.set-outputs.outputs.has_high_critical }}
 
   summary:
     description: "Markdown summary of findings by severity"
-    value: $
-{{ steps.set-outputs.outputs.summary }}
+    value: ${{  steps.set-outputs.outputs.summary }}
 
   report_path:
     description: "Path to the saved JSON report file"
-    value: $
-{{ steps.set-outputs.outputs.report_path }}
+    value: ${{  steps.set-outputs.outputs.report_path }}
 
 runs:
   using: "composite"
@@ -90,13 +82,11 @@ runs:
         if python3 -c "from vu1nz.cli import app" 2>/dev/null; then
           echo "vu1nz already installed, skipping"
         else
-          REF="$
-{{ github.action_ref }}"
+          REF="${{  github.action_ref }}"
           [ -z "$REF" ] && REF="main"
           pip install --quiet \
             httpx rich typer pyyaml \
-            "git+https://github.com/$
-{{ github.action_repository }}.git@${REF}"
+            "git+https://github.com/${{  github.action_repository }}.git@${REF}"
         fi
 
     # ── Run the scan ───────────────────────────────────────────────
@@ -105,32 +95,23 @@ runs:
       shell: bash
       continue-on-error: true
       run: |
-        vu1nz actions scan $
-{{ github.repository }} \
-          --token "$
-{{ inputs.token }}" \
-          --output "$
-{{ inputs.output_dir }}" \
-          --json 2>&1 | tee "$
-{{ runner.temp }}/vu1nz-scan.json"
+        vu1nz actions scan ${{  github.repository }} \
+          --token "${{  inputs.token }}" \
+          --output "${{  inputs.output_dir }}" \
+          --json 2>&1 | tee "${{  runner.temp }}/vu1nz-scan.json"
 
     # ── Claude AI review (optional) ────────────────────────────────
     - name: Claude AI code review
       if: inputs.claude_api_key != ''
       shell: bash
       env:
-        ANTHROPIC_API_KEY: $
-{{ inputs.claude_api_key }}
+        ANTHROPIC_API_KEY: ${{  inputs.claude_api_key }}
       run: |
-        vu1nz actions scan $
-{{ github.repository }} \
-          --token "$
-{{ inputs.token }}" \
+        vu1nz actions scan ${{  github.repository }} \
+          --token "${{  inputs.token }}" \
           --claude \
-          --claude-model "$
-{{ inputs.claude_model }}" \
-          --output "$
-{{ inputs.output_dir }}"
+          --claude-model "${{  inputs.claude_model }}" \
+          --output "${{  inputs.output_dir }}"
 
     # ── Set outputs ────────────────────────────────────────────────
     - name: Parse results and set outputs
@@ -169,8 +150,7 @@ runs:
             out.write(f"has_high_critical={'true' if has_hc else 'false'}\n")
             out.write(f"summary={summary}\n")
 
-        report_dir = "$
-{{ inputs.output_dir }}"
+        report_dir = "${{  inputs.output_dir }}"
         report_path = "./" + report_dir
         try:
             files = os.listdir(report_path)
@@ -189,8 +169,7 @@ runs:
         python3 << 'PYEOF'
         import json, os
 
-        threshold = "$
-{{ inputs.fail_on }}".lower()
+        threshold = "${{  inputs.fail_on }}".lower()
         order = {"none": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
         threshold_num = order.get(threshold, 3)
 
@@ -217,6 +196,5 @@ runs:
       uses: actions/upload-artifact@v4
       with:
         name: vu1nz-actions-scan-report
-        path: $
-{{ inputs.output_dir }}/
+        path: ${{  inputs.output_dir }}/
         retention-days: 30
