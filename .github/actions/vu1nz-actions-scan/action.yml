@@ -108,7 +108,11 @@ runs:
     # Hits the vu1nz license API. New orgs get a 14-day free trial
     # automatically. After the trial expires, the workflow fails with
     # a link to https://vu1nz.com/billing.
+    #
+    # The API returns the org's license_key — we capture it as a step
+    # output so the later "Report scan results" step can authenticate.
     - name: Verify vu1nz subscription
+      id: subscription
       shell: bash
       run: |
         ORG="${GITHUB_REPOSITORY%%/*}"
@@ -128,6 +132,8 @@ runs:
         if [ -z "$RESP" ]; then
           echo "::warning::vu1nz license API unreachable - allowing scan to proceed"
           echo "::endgroup::"
+          # No license_key captured but downstream steps tolerate empty.
+          echo "license_key=" >> "$GITHUB_OUTPUT"
           exit 0
         fi
 
@@ -137,6 +143,14 @@ runs:
         STATUS=$(echo "$RESP" | jq -r '.status // "unknown"')
         MSG=$(echo "$RESP" | jq -r '.message // ""')
         UPGRADE=$(echo "$RESP" | jq -r '.upgrade_url // "https://vu1nz.com/billing"')
+        KEY=$(echo "$RESP" | jq -r '.license_key // ""')
+
+        # Capture license_key for the "Report scan results" step.
+        echo "license_key=${KEY}" >> "$GITHUB_OUTPUT"
+        # Don't echo the key to the run log — mask it.
+        if [ -n "$KEY" ]; then
+          echo "::add-mask::$KEY"
+        fi
 
         echo "::endgroup::"
 
@@ -351,3 +365,90 @@ else:
         name: vu1nz-actions-scan-report
         path: ${{ inputs.output_dir }}/
         retention-days: 30
+
+    # ── Report results to vu1nz cloud ──────────────────────────────
+    # POSTs scan findings to the vu1nz dashboard so users see them at
+    # https://vu1nz.com/dashboard/scans. Authenticates with the
+    # license_key captured from the subscription check step.
+    #
+    # Skips silently if no license_key is available (e.g. API was
+    # unreachable during license check) so the dashboard never blocks
+    # the build.
+    - name: Report scan results to vu1nz cloud
+      if: always() && steps.subscription.outputs.license_key != ''
+      shell: bash
+      continue-on-error: true
+      run: |
+        SCAN_FILE="${{ runner.temp }}/vu1nz-scan.json"
+        if [ ! -s "$SCAN_FILE" ]; then
+          echo "No scan output to report"
+          exit 0
+        fi
+
+        # Build the POST body: include license_key, repository, ref,
+        # commit_sha, pr_number, findings_count, counts, findings.
+        PR_NUMBER=""
+        if [ "${{ github.event_name }}" = "pull_request" ] || \
+           [ "${{ github.event_name }}" = "pull_request_target" ]; then
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+        fi
+
+        python3 << PYEOF
+        import json, os, urllib.request, urllib.error
+
+        with open("$SCAN_FILE") as f:
+            data = json.load(f)
+
+        findings = data.get("findings", []) or []
+        counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+        for f in findings:
+            sev = (f.get("severity") or "").lower()
+            if sev in counts:
+                counts[sev] += 1
+
+        # Trim very large findings so we don't blow the API's 2k cap.
+        if len(findings) > 1000:
+            findings = findings[:1000]
+
+        pr = "${PR_NUMBER}"
+        body = {
+            "license_key": "${{ steps.subscription.outputs.license_key }}",
+            "repository": "${{ github.repository }}",
+            "ref": "${{ github.ref }}",
+            "commit_sha": "${{ github.sha }}",
+            "findings_count": len(findings),
+            "counts": counts,
+            "findings": findings,
+        }
+        if pr:
+            try:
+                body["pr_number"] = int(pr)
+            except ValueError:
+                pass
+
+        # Pull AI summary if present
+        ai_path = "${{ inputs.output_dir }}/ai_summary.txt"
+        if os.path.exists(ai_path):
+            try:
+                with open(ai_path) as f:
+                    body["ai_summary"] = f.read()[:8000]
+            except Exception:
+                pass
+
+        url = "${{ inputs.api_url }}/api/gh/webhook"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                resp = json.loads(r.read().decode() or "{}")
+                print(f"::notice::Reported {body['findings_count']} findings to vu1nz cloud (run_id={resp.get('run_id', '?')})")
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")[:200]
+            print(f"::warning::Failed to report to vu1nz cloud ({e.code}): {err_body}")
+        except Exception as e:
+            print(f"::warning::Failed to report to vu1nz cloud: {e}")
+        PYEOF
