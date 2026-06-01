@@ -8,13 +8,13 @@
 #       steps:
 #         - uses: profullstack/vu1nz-gh-actions/.github/actions/vu1nz-actions-scan@v1
 #           with:
-#             token: ${{  secrets.GITHUB_TOKEN }}
+#             token: ${{ secrets.GITHUB_TOKEN }}
 #
 #   With Claude AI code review (requires ANTHROPIC_API_KEY secret):
 #         - uses: profullstack/vu1nz-gh-actions/.github/actions/vu1nz-actions-scan@v1
 #           with:
-#             token: ${{  secrets.GITHUB_TOKEN }}
-#             claude_api_key: ${{  secrets.ANTHROPIC_API_KEY }}
+#             token: ${{ secrets.GITHUB_TOKEN }}
+#             claude_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
 
 name: "vu1nz Actions Security Scan"
 description: >
@@ -27,7 +27,22 @@ inputs:
   token:
     description: "GitHub token for API access (defaults to auto-generated GITHUB_TOKEN)"
     required: false
-    default: ${{  github.token }}
+    default: ${{ github.token }}
+
+  license_key:
+    description: "vu1nz license key from https://vu1nz.com/billing (after trial)"
+    required: false
+    default: ""
+
+  api_url:
+    description: "vu1nz license-check API URL (override for self-hosting)"
+    required: false
+    default: "https://vu1nz.com"
+
+  scan_packages:
+    description: "Also scan newly added packages in PR diff for malware/typosquats"
+    required: false
+    default: "true"
 
   claude_api_key:
     description: "Anthropic API key for Claude AI code review (optional)"
@@ -52,19 +67,19 @@ inputs:
 outputs:
   findings_count:
     description: "Total number of security findings detected"
-    value: ${{  steps.set-outputs.outputs.findings_count }}
+    value: ${{ steps.set-outputs.outputs.findings_count }}
 
   has_high_critical:
     description: "Whether high or critical severity findings exist"
-    value: ${{  steps.set-outputs.outputs.has_high_critical }}
+    value: ${{ steps.set-outputs.outputs.has_high_critical }}
 
   summary:
     description: "Markdown summary of findings by severity"
-    value: ${{  steps.set-outputs.outputs.summary }}
+    value: ${{ steps.set-outputs.outputs.summary }}
 
   report_path:
     description: "Path to the saved JSON report file"
-    value: ${{  steps.set-outputs.outputs.report_path }}
+    value: ${{ steps.set-outputs.outputs.report_path }}
 
 runs:
   using: "composite"
@@ -82,12 +97,62 @@ runs:
         if python3 -c "from vu1nz.cli import app" 2>/dev/null; then
           echo "vu1nz already installed, skipping"
         else
-          REF="${{  github.action_ref }}"
+          REF="${{ github.action_ref }}"
           [ -z "$REF" ] && REF="main"
           pip install --quiet \
             httpx rich typer pyyaml \
-            "git+https://github.com/${{  github.action_repository }}.git@${REF}"
+            "git+https://github.com/${{ github.action_repository }}.git@${REF}"
         fi
+
+    # ── License / trial check ──────────────────────────────────────
+    # Hits the vu1nz license API. New orgs get a 14-day free trial
+    # automatically. After the trial expires, the workflow fails with
+    # a link to https://vu1nz.com/billing.
+    - name: Verify vu1nz subscription
+      shell: bash
+      run: |
+        ORG="${GITHUB_REPOSITORY%%/*}"
+        echo "::group::vu1nz license check for $ORG"
+        BODY=$(jq -nc \
+          --arg org "$ORG" \
+          --arg repo "${{ github.repository }}" \
+          --arg key  "${{ inputs.license_key }}" \
+          '{github_org: $org, repository: $repo, license_key: $key}')
+
+        # Tolerate transient network failures: don't block CI on our API.
+        RESP=$(curl -sS --max-time 10 \
+          -H 'Content-Type: application/json' \
+          -d "$BODY" \
+          "${{ inputs.api_url }}/api/license/check" || echo '')
+
+        if [ -z "$RESP" ]; then
+          echo "::warning::vu1nz license API unreachable - allowing scan to proceed"
+          echo "::endgroup::"
+          exit 0
+        fi
+
+        echo "$RESP" | jq .
+
+        OK=$(echo "$RESP" | jq -r '.ok // false')
+        STATUS=$(echo "$RESP" | jq -r '.status // "unknown"')
+        MSG=$(echo "$RESP" | jq -r '.message // ""')
+        UPGRADE=$(echo "$RESP" | jq -r '.upgrade_url // "https://vu1nz.com/billing"')
+
+        echo "::endgroup::"
+
+        if [ "$OK" != "true" ]; then
+          echo "::error title=vu1nz subscription required::${MSG}"
+          echo ""
+          echo "  Your 14-day free trial has ended (or the org has no active"
+          echo "  subscription). Continue protecting your CI/CD pipeline and"
+          echo "  PR package diffs by subscribing for \$100/month per org."
+          echo ""
+          echo "    Upgrade: ${UPGRADE}"
+          echo ""
+          exit 1
+        fi
+
+        echo "${MSG}"
 
     # ── Run the scan ───────────────────────────────────────────────
     - name: Scan workflows for vulnerabilities
@@ -95,23 +160,108 @@ runs:
       shell: bash
       continue-on-error: true
       run: |
-        vu1nz actions scan ${{  github.repository }} \
-          --token "${{  inputs.token }}" \
-          --output "${{  inputs.output_dir }}" \
-          --json 2>&1 | tee "${{  runner.temp }}/vu1nz-scan.json"
+        vu1nz actions scan ${{ github.repository }} \
+          --token "${{ inputs.token }}" \
+          --output "${{ inputs.output_dir }}" \
+          --json 2>&1 | tee "${{ runner.temp }}/vu1nz-scan.json"
+
+    # ── Package malware sweep (PR diffs) ───────────────────────────
+    # Scans newly added entries in package-lock.json / pnpm-lock.yaml /
+    # yarn.lock / requirements.txt / Pipfile.lock / poetry.lock /
+    # Cargo.lock / Gemfile.lock / go.sum / composer.lock for malware,
+    # typosquats, install-script exfil, and low-reputation packages.
+    #
+    # Checks per package:
+    #   1. OSV.dev — known malware + CVEs
+    #   2. Levenshtein typosquat distance vs top packages
+    #   3. npm registry — install scripts (preinstall/install/postinstall)
+    #   4. npm/PyPI registry — package age + xz-utils-style version bursts
+    #
+    # Failure threshold matches the `fail_on` input.
+    - name: Scan new packages in PR diff
+      id: pkgdiff
+      if: inputs.scan_packages == 'true'
+      shell: bash
+      continue-on-error: true
+      run: |
+        if [ "${{ github.event_name }}" != "pull_request" ] && \
+           [ "${{ github.event_name }}" != "pull_request_target" ]; then
+          echo "Not a pull_request event - skipping package diff scan"
+          exit 0
+        fi
+
+        BASE="${{ github.event.pull_request.base.sha }}"
+        HEAD="${{ github.event.pull_request.head.sha }}"
+        if [ -z "$BASE" ] || [ -z "$HEAD" ]; then
+          echo "No PR refs available - skipping"
+          exit 0
+        fi
+
+        # Ensure both refs are present locally so git diff works against a
+        # shallow clone (the default for actions/checkout@v4).
+        git fetch --depth=1 origin "$BASE" 2>/dev/null || true
+        git fetch --depth=1 origin "$HEAD" 2>/dev/null || true
+
+        echo "::group::Scanning newly added packages in PR diff"
+        vu1nz pkgdiff scan \
+          --base "$BASE" \
+          --head "$HEAD" \
+          --token "${{ inputs.token }}" \
+          --output "${{ inputs.output_dir }}" \
+          --fail-on "${{ inputs.fail_on }}" \
+          --json > "${{ runner.temp }}/vu1nz-pkgdiff.json"
+        STATUS=$?
+        echo "::endgroup::"
+
+        # Always print the human summary too.
+        if [ -s "${{ runner.temp }}/vu1nz-pkgdiff.json" ]; then
+          python3 -c "
+import json, sys
+d = json.load(open('${{ runner.temp }}/vu1nz-pkgdiff.json'))
+print(f'Packages added: {d[\"packages_added\"]}')
+print(f'Findings: {sum(d[\"counts\"].values())} ({d[\"counts\"]})')
+for f in d['findings'][:25]:
+    print(f'  [{f[\"severity\"].upper()}] {f[\"package\"]}@{f[\"version\"]} - {f[\"title\"][:80]}')
+"
+        fi
+
+        # Echo to GitHub Actions step summary so it appears in the run UI.
+        if [ -n "$GITHUB_STEP_SUMMARY" ] && [ -s "${{ runner.temp }}/vu1nz-pkgdiff.json" ]; then
+          {
+            echo "## 📦 vu1nz pkgdiff"
+            echo ""
+            python3 -c "
+import json
+d = json.load(open('${{ runner.temp }}/vu1nz-pkgdiff.json'))
+c = d['counts']
+print(f'**{d[\"packages_added\"]} package(s) added/bumped** &mdash; Critical: {c[\"critical\"]} &middot; High: {c[\"high\"]} &middot; Medium: {c[\"medium\"]} &middot; Low: {c[\"low\"]}')
+print()
+if not d['findings']:
+    print('No supply-chain issues found.')
+else:
+    print('| Severity | Package | Issue |')
+    print('|---|---|---|')
+    for f in d['findings'][:50]:
+        title = f['title'].replace('|','\\\\|')[:120]
+        print(f'| {f[\"severity\"].upper()} | {f[\"package\"]}@{f[\"version\"]} | {title} |')
+"
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+        exit $STATUS
 
     # ── Claude AI review (optional) ────────────────────────────────
     - name: Claude AI code review
       if: inputs.claude_api_key != ''
       shell: bash
       env:
-        ANTHROPIC_API_KEY: ${{  inputs.claude_api_key }}
+        ANTHROPIC_API_KEY: ${{ inputs.claude_api_key }}
       run: |
-        vu1nz actions scan ${{  github.repository }} \
-          --token "${{  inputs.token }}" \
+        vu1nz actions scan ${{ github.repository }} \
+          --token "${{ inputs.token }}" \
           --claude \
-          --claude-model "${{  inputs.claude_model }}" \
-          --output "${{  inputs.output_dir }}"
+          --claude-model "${{ inputs.claude_model }}" \
+          --output "${{ inputs.output_dir }}"
 
     # ── Set outputs ────────────────────────────────────────────────
     - name: Parse results and set outputs
@@ -139,18 +289,21 @@ runs:
         total = len(findings)
         has_hc = counts["critical"] > 0 or counts["high"] > 0
 
+        # Build single-line summary (multi-line values need GITHUB_OUTPUT delimiter syntax)
         summary_parts = [f"**vu1nz Actions Scan** — {total} total findings"]
         for sev in ("critical", "high", "medium", "low"):
             if counts[sev] > 0:
                 summary_parts.append(f"{sev.upper()}: {counts[sev]}")
         summary = " | ".join(summary_parts)
 
+        # Write outputs (\n = real newlines in Python)
         with open(os.environ.get("GITHUB_OUTPUT", ""), "a") as out:
             out.write(f"findings_count={total}\n")
             out.write(f"has_high_critical={'true' if has_hc else 'false'}\n")
             out.write(f"summary={summary}\n")
 
-        report_dir = "${{  inputs.output_dir }}"
+        # Find report file (separate write, same with block)
+        report_dir = "${{ inputs.output_dir }}"
         report_path = "./" + report_dir
         try:
             files = os.listdir(report_path)
@@ -169,7 +322,7 @@ runs:
         python3 << 'PYEOF'
         import json, os
 
-        threshold = "${{  inputs.fail_on }}".lower()
+        threshold = "${{ inputs.fail_on }}".lower()
         order = {"none": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
         threshold_num = order.get(threshold, 3)
 
@@ -196,5 +349,5 @@ runs:
       uses: actions/upload-artifact@v4
       with:
         name: vu1nz-actions-scan-report
-        path: ${{  inputs.output_dir }}/
+        path: ${{ inputs.output_dir }}/
         retention-days: 30
