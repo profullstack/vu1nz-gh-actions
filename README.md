@@ -57,15 +57,20 @@ jobs:
   scan-actions:
     runs-on: ubuntu-latest
     steps:
-      - uses: profullstack/vu1nz-gh-actions/.github/actions/vu1nz-actions-scan@v1
+      - uses: actions/checkout@v4
+      - uses: profullstack/vu1nz-gh-actions@v1.1.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
+The older path `profullstack/vu1nz-gh-actions/.github/actions/vu1nz-actions-scan@<ref>`
+still works; it is the same action. New organizations get a 14-day free trial,
+then a subscription from [vu1nz.com/billing](https://vu1nz.com/billing).
+
 ### With Claude AI Review
 
 ```yaml
-      - uses: profullstack/vu1nz-gh-actions/.github/actions/vu1nz-actions-scan@v1
+      - uses: profullstack/vu1nz-gh-actions@v1.1.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           claude_api_key: ${{ secrets.ANTHROPIC_API_KEY }}

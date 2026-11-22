@@ -1,20 +1,23 @@
-# 🔐 vu1nz Actions Security Scan — Reusable GitHub Action
+# vu1nz Actions Security Scan (https://vu1nz.com)
 #
-# Usage in your workflow:
+# Usage:
 #
 #   jobs:
 #     scan-actions:
 #       runs-on: ubuntu-latest
 #       steps:
-#         - uses: profullstack/vu1nz-gh-actions/.github/actions/vu1nz-actions-scan@v1
+#         - uses: actions/checkout@v4
+#         - uses: profullstack/vu1nz-gh-actions@v1.1.0
 #           with:
 #             token: ${{ secrets.GITHUB_TOKEN }}
 #
 #   With Claude AI code review (requires ANTHROPIC_API_KEY secret):
-#         - uses: profullstack/vu1nz-gh-actions/.github/actions/vu1nz-actions-scan@v1
-#           with:
-#             token: ${{ secrets.GITHUB_TOKEN }}
 #             claude_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+#
+# This root action.yml is what the GitHub Marketplace lists.
+# .github/actions/vu1nz-actions-scan/action.yml is a byte-identical copy kept
+# for existing `uses: .../.github/actions/vu1nz-actions-scan@v1` users;
+# tests/test_action_metadata.py checks they match.
 
 name: "vu1nz Actions Security Scan"
 description: >
@@ -22,6 +25,10 @@ description: >
   script injection, unpinned actions, pull_request_target abuse,
   secret leaks, permission issues, and supply chain risks.
   Optionally runs AI-powered code review via Claude.
+author: "Profullstack"
+branding:
+  icon: "shield"
+  color: "red"
 
 inputs:
   token:
@@ -81,6 +88,8 @@ outputs:
     description: "Path to the saved JSON report file"
     value: ${{ steps.set-outputs.outputs.report_path }}
 
+# Every value from inputs or the event reaches the scripts through env, never
+# by ${{ }} interpolation into the script text.
 runs:
   using: "composite"
 
@@ -93,65 +102,64 @@ runs:
 
     - name: Install vu1nz from source
       shell: bash
+      env:
+        ACTION_REPO: ${{ github.action_repository }}
+        ACTION_REF: ${{ github.action_ref }}
       run: |
         if python3 -c "from vu1nz.cli import app" 2>/dev/null; then
           echo "vu1nz already installed, skipping"
+        elif [ -z "$ACTION_REPO" ]; then
+          # A local `uses: ./...` (this repo's own dogfood run): install the checkout.
+          pip install --quiet "$GITHUB_WORKSPACE"
         else
-          REF="${{ github.action_ref }}"
-          [ -z "$REF" ] && REF="main"
+          REF="${ACTION_REF:-main}"
           pip install --quiet \
             httpx rich typer pyyaml \
-            "git+https://github.com/${{ github.action_repository }}.git@${REF}"
+            "git+https://github.com/${ACTION_REPO}.git@${REF}"
         fi
 
     # ── License / trial check ──────────────────────────────────────
     # Hits the vu1nz license API. New orgs get a 14-day free trial
     # automatically. After the trial expires, the workflow fails with
-    # a link to https://vu1nz.com/billing.
-    #
-    # The API returns the org's license_key — we capture it as a step
-    # output so the later "Report scan results" step can authenticate.
+    # a link to https://vu1nz.com/billing. The returned license_key is a
+    # (masked) step output for the "Report scan results" step.
     - name: Verify vu1nz subscription
       id: subscription
       shell: bash
+      env:
+        LICENSE_KEY: ${{ inputs.license_key }}
+        API_URL: ${{ inputs.api_url }}
       run: |
         ORG="${GITHUB_REPOSITORY%%/*}"
         echo "::group::vu1nz license check for $ORG"
         BODY=$(jq -nc \
           --arg org "$ORG" \
-          --arg repo "${{ github.repository }}" \
-          --arg key  "${{ inputs.license_key }}" \
+          --arg repo "$GITHUB_REPOSITORY" \
+          --arg key  "$LICENSE_KEY" \
           '{github_org: $org, repository: $repo, license_key: $key}')
 
         # Tolerate transient network failures: don't block CI on our API.
         RESP=$(curl -sS --max-time 10 \
           -H 'Content-Type: application/json' \
           -d "$BODY" \
-          "${{ inputs.api_url }}/api/license/check" || echo '')
+          "${API_URL}/api/license/check" || echo '')
 
         if [ -z "$RESP" ]; then
           echo "::warning::vu1nz license API unreachable - allowing scan to proceed"
           echo "::endgroup::"
-          # No license_key captured but downstream steps tolerate empty.
           echo "license_key=" >> "$GITHUB_OUTPUT"
           exit 0
         fi
 
-        echo "$RESP" | jq .
-
         OK=$(echo "$RESP" | jq -r '.ok // false')
-        STATUS=$(echo "$RESP" | jq -r '.status // "unknown"')
         MSG=$(echo "$RESP" | jq -r '.message // ""')
         UPGRADE=$(echo "$RESP" | jq -r '.upgrade_url // "https://vu1nz.com/billing"')
         KEY=$(echo "$RESP" | jq -r '.license_key // ""')
-
-        # Capture license_key for the "Report scan results" step.
-        echo "license_key=${KEY}" >> "$GITHUB_OUTPUT"
-        # Don't echo the key to the run log — mask it.
         if [ -n "$KEY" ]; then
           echo "::add-mask::$KEY"
         fi
-
+        echo "$RESP" | jq 'del(.license_key)'
+        echo "license_key=${KEY}" >> "$GITHUB_OUTPUT"
         echo "::endgroup::"
 
         if [ "$OK" != "true" ]; then
@@ -173,93 +181,91 @@ runs:
       id: scan
       shell: bash
       continue-on-error: true
+      env:
+        GH_TOKEN_INPUT: ${{ inputs.token }}
+        OUTPUT_DIR: ${{ inputs.output_dir }}
       run: |
-        vu1nz actions scan ${{ github.repository }} \
-          --token "${{ inputs.token }}" \
-          --output "${{ inputs.output_dir }}" \
-          --json 2>&1 | tee "${{ runner.temp }}/vu1nz-scan.json"
+        vu1nz actions scan "$GITHUB_REPOSITORY" \
+          --token "$GH_TOKEN_INPUT" \
+          --output "$OUTPUT_DIR" \
+          --json 2>&1 | tee "$RUNNER_TEMP/vu1nz-scan.json"
 
     # ── Package malware sweep (PR diffs) ───────────────────────────
-    # Scans newly added entries in package-lock.json / pnpm-lock.yaml /
-    # yarn.lock / requirements.txt / Pipfile.lock / poetry.lock /
-    # Cargo.lock / Gemfile.lock / go.sum / composer.lock for malware,
-    # typosquats, install-script exfil, and low-reputation packages.
-    #
-    # Checks per package:
-    #   1. OSV.dev — known malware + CVEs
-    #   2. Levenshtein typosquat distance vs top packages
-    #   3. npm registry — install scripts (preinstall/install/postinstall)
-    #   4. npm/PyPI registry — package age + xz-utils-style version bursts
-    #
-    # Failure threshold matches the `fail_on` input.
+    # Scans newly added entries in lockfiles for malware, typosquats,
+    # install-script exfil, and low-reputation packages, when the
+    # installed vu1nz has the pkgdiff command. Failure threshold matches
+    # the `fail_on` input.
     - name: Scan new packages in PR diff
       id: pkgdiff
       if: inputs.scan_packages == 'true'
       shell: bash
       continue-on-error: true
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        BASE: ${{ github.event.pull_request.base.sha }}
+        HEAD: ${{ github.event.pull_request.head.sha }}
+        GH_TOKEN_INPUT: ${{ inputs.token }}
+        OUTPUT_DIR: ${{ inputs.output_dir }}
+        FAIL_ON: ${{ inputs.fail_on }}
       run: |
-        if [ "${{ github.event_name }}" != "pull_request" ] && \
-           [ "${{ github.event_name }}" != "pull_request_target" ]; then
+        if [ "$EVENT_NAME" != "pull_request" ] && [ "$EVENT_NAME" != "pull_request_target" ]; then
           echo "Not a pull_request event - skipping package diff scan"
           exit 0
         fi
-
-        BASE="${{ github.event.pull_request.base.sha }}"
-        HEAD="${{ github.event.pull_request.head.sha }}"
         if [ -z "$BASE" ] || [ -z "$HEAD" ]; then
           echo "No PR refs available - skipping"
           exit 0
         fi
+        if ! vu1nz pkgdiff --help >/dev/null 2>&1; then
+          echo "::notice::this vu1nz build has no pkgdiff command - skipping package diff scan"
+          exit 0
+        fi
 
-        # Ensure both refs are present locally so git diff works against a
-        # shallow clone (the default for actions/checkout@v4).
+        # Make both refs present locally so git diff works on a shallow clone.
         git fetch --depth=1 origin "$BASE" 2>/dev/null || true
         git fetch --depth=1 origin "$HEAD" 2>/dev/null || true
 
+        REPORT="$RUNNER_TEMP/vu1nz-pkgdiff.json"
         echo "::group::Scanning newly added packages in PR diff"
+        STATUS=0
         vu1nz pkgdiff scan \
           --base "$BASE" \
           --head "$HEAD" \
-          --token "${{ inputs.token }}" \
-          --output "${{ inputs.output_dir }}" \
-          --fail-on "${{ inputs.fail_on }}" \
-          --json > "${{ runner.temp }}/vu1nz-pkgdiff.json"
-        STATUS=$?
+          --token "$GH_TOKEN_INPUT" \
+          --output "$OUTPUT_DIR" \
+          --fail-on "$FAIL_ON" \
+          --json > "$REPORT" || STATUS=$?
         echo "::endgroup::"
 
-        # Always print the human summary too.
-        if [ -s "${{ runner.temp }}/vu1nz-pkgdiff.json" ]; then
-          python3 -c "
-import json, sys
-d = json.load(open('${{ runner.temp }}/vu1nz-pkgdiff.json'))
-print(f'Packages added: {d[\"packages_added\"]}')
-print(f'Findings: {sum(d[\"counts\"].values())} ({d[\"counts\"]})')
-for f in d['findings'][:25]:
-    print(f'  [{f[\"severity\"].upper()}] {f[\"package\"]}@{f[\"version\"]} - {f[\"title\"][:80]}')
-"
+        if [ -s "$REPORT" ]; then
+          python3 - "$REPORT" <<'PY'
+        import json, sys
+        d = json.load(open(sys.argv[1]))
+        print(f"Packages added: {d['packages_added']}")
+        print(f"Findings: {sum(d['counts'].values())} ({d['counts']})")
+        for f in d['findings'][:25]:
+            print(f"  [{f['severity'].upper()}] {f['package']}@{f['version']} - {f['title'][:80]}")
+        PY
         fi
 
-        # Echo to GitHub Actions step summary so it appears in the run UI.
-        if [ -n "$GITHUB_STEP_SUMMARY" ] && [ -s "${{ runner.temp }}/vu1nz-pkgdiff.json" ]; then
-          {
-            echo "## 📦 vu1nz pkgdiff"
-            echo ""
-            python3 -c "
-import json
-d = json.load(open('${{ runner.temp }}/vu1nz-pkgdiff.json'))
-c = d['counts']
-print(f'**{d[\"packages_added\"]} package(s) added/bumped** &mdash; Critical: {c[\"critical\"]} &middot; High: {c[\"high\"]} &middot; Medium: {c[\"medium\"]} &middot; Low: {c[\"low\"]}')
-print()
-if not d['findings']:
-    print('No supply-chain issues found.')
-else:
-    print('| Severity | Package | Issue |')
-    print('|---|---|---|')
-    for f in d['findings'][:50]:
-        title = f['title'].replace('|','\\\\|')[:120]
-        print(f'| {f[\"severity\"].upper()} | {f[\"package\"]}@{f[\"version\"]} | {title} |')
-"
-          } >> "$GITHUB_STEP_SUMMARY"
+        if [ -n "${GITHUB_STEP_SUMMARY:-}" ] && [ -s "$REPORT" ]; then
+          python3 - "$REPORT" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+        import json, sys
+        d = json.load(open(sys.argv[1]))
+        c = d['counts']
+        print("## vu1nz pkgdiff")
+        print()
+        print(f"**{d['packages_added']} package(s) added/bumped**: Critical: {c['critical']} | High: {c['high']} | Medium: {c['medium']} | Low: {c['low']}")
+        print()
+        if not d['findings']:
+            print('No supply-chain issues found.')
+        else:
+            print('| Severity | Package | Issue |')
+            print('|---|---|---|')
+            for f in d['findings'][:50]:
+                title = f['title'].replace('|', '\\|')[:120]
+                print(f"| {f['severity'].upper()} | {f['package']}@{f['version']} | {title} |")
+        PY
         fi
 
         exit $STATUS
@@ -270,29 +276,32 @@ else:
       shell: bash
       env:
         ANTHROPIC_API_KEY: ${{ inputs.claude_api_key }}
+        GH_TOKEN_INPUT: ${{ inputs.token }}
+        CLAUDE_MODEL: ${{ inputs.claude_model }}
+        OUTPUT_DIR: ${{ inputs.output_dir }}
       run: |
-        vu1nz actions scan ${{ github.repository }} \
-          --token "${{ inputs.token }}" \
+        vu1nz actions scan "$GITHUB_REPOSITORY" \
+          --token "$GH_TOKEN_INPUT" \
           --claude \
-          --claude-model "${{ inputs.claude_model }}" \
-          --output "${{ inputs.output_dir }}"
+          --claude-model "$CLAUDE_MODEL" \
+          --output "$OUTPUT_DIR"
 
     # ── Set outputs ────────────────────────────────────────────────
     - name: Parse results and set outputs
       id: set-outputs
       shell: bash
+      env:
+        OUTPUT_DIR: ${{ inputs.output_dir }}
       run: |
-        python3 << 'PYEOF'
+        python3 <<'PY'
         import json, os
 
         scan_file = os.environ.get("RUNNER_TEMP", "") + "/vu1nz-scan.json"
         findings = []
         counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
-
         try:
             with open(scan_file) as f:
-                data = json.load(f)
-            findings = data.get("findings", [])
+                findings = json.load(f).get("findings", [])
             for f in findings:
                 sev = f.get("severity", "").lower()
                 if sev in counts:
@@ -302,60 +311,54 @@ else:
 
         total = len(findings)
         has_hc = counts["critical"] > 0 or counts["high"] > 0
-
-        # Build single-line summary (multi-line values need GITHUB_OUTPUT delimiter syntax)
-        summary_parts = [f"**vu1nz Actions Scan** — {total} total findings"]
+        parts = [f"**vu1nz Actions Scan**: {total} total findings"]
         for sev in ("critical", "high", "medium", "low"):
             if counts[sev] > 0:
-                summary_parts.append(f"{sev.upper()}: {counts[sev]}")
-        summary = " | ".join(summary_parts)
+                parts.append(f"{sev.upper()}: {counts[sev]}")
 
-        # Write outputs (\n = real newlines in Python)
-        with open(os.environ.get("GITHUB_OUTPUT", ""), "a") as out:
-            out.write(f"findings_count={total}\n")
-            out.write(f"has_high_critical={'true' if has_hc else 'false'}\n")
-            out.write(f"summary={summary}\n")
-
-        # Find report file (separate write, same with block)
-        report_dir = "${{ inputs.output_dir }}"
-        report_path = "./" + report_dir
+        report_path = ""
+        report_dir = "./" + os.environ.get("OUTPUT_DIR", "")
         try:
-            files = os.listdir(report_path)
-            report_files = sorted(f for f in files if f.endswith(".json"))
-            if report_files:
-                out.write(f"report_path={report_path}/{report_files[-1]}\n")
+            reports = sorted(f for f in os.listdir(report_dir) if f.endswith(".json"))
+            if reports:
+                report_path = f"{report_dir}/{reports[-1]}"
         except Exception:
             pass
-        PYEOF
+
+        with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+            out.write(f"findings_count={total}\n")
+            out.write(f"has_high_critical={'true' if has_hc else 'false'}\n")
+            out.write(f"summary={' | '.join(parts)}\n")
+            if report_path:
+                out.write(f"report_path={report_path}\n")
+        PY
 
     # ── Fail if threshold exceeded ─────────────────────────────────
     - name: Check findings against fail threshold
       if: inputs.fail_on != 'none'
       shell: bash
+      env:
+        FAIL_ON: ${{ inputs.fail_on }}
       run: |
-        python3 << 'PYEOF'
-        import json, os
+        python3 <<'PY'
+        import json, os, sys
 
-        threshold = "${{ inputs.fail_on }}".lower()
+        threshold = os.environ.get("FAIL_ON", "high").lower()
         order = {"none": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
         threshold_num = order.get(threshold, 3)
-
         scan_file = os.environ.get("RUNNER_TEMP", "") + "/vu1nz-scan.json"
         try:
             with open(scan_file) as f:
-                data = json.load(f)
-            findings = data.get("findings", [])
-            worst = max(
-                (order.get(f.get("severity", "").lower(), 0) for f in findings),
-                default=0,
-            )
-            if worst >= threshold_num:
-                print(f"::error::vu1nz found issues at or above {threshold.upper()} severity")
-                exit(1)
-            print(f"::notice::No issues at or above {threshold.upper()} severity")
+                findings = json.load(f).get("findings", [])
         except Exception as e:
             print(f"::warning::Could not parse scan results: {e}")
-        PYEOF
+            sys.exit(0)
+        worst = max((order.get(f.get("severity", "").lower(), 0) for f in findings), default=0)
+        if worst >= threshold_num:
+            print(f"::error::vu1nz found issues at or above {threshold.upper()} severity")
+            sys.exit(1)
+        print(f"::notice::No issues at or above {threshold.upper()} severity")
+        PY
 
     # ── Upload report ──────────────────────────────────────────────
     - name: Upload scan report artifact
@@ -364,70 +367,55 @@ else:
       with:
         name: vu1nz-actions-scan-report
         path: ${{ inputs.output_dir }}/
-        retention-days: 30
+        retention-days: 1
+        if-no-files-found: ignore
 
     # ── Report results to vu1nz cloud ──────────────────────────────
-    # POSTs scan findings to the vu1nz dashboard so users see them at
-    # https://vu1nz.com/dashboard/scans. Authenticates with the
-    # license_key captured from the subscription check step.
-    #
-    # Skips silently if no license_key is available (e.g. API was
-    # unreachable during license check) so the dashboard never blocks
-    # the build.
+    # POSTs scan findings to https://vu1nz.com/dashboard/scans with the
+    # license_key from the subscription step. Skips when there is no key.
     - name: Report scan results to vu1nz cloud
       if: always() && steps.subscription.outputs.license_key != ''
       shell: bash
       continue-on-error: true
+      env:
+        LICENSE_KEY: ${{ steps.subscription.outputs.license_key }}
+        API_URL: ${{ inputs.api_url }}
+        OUTPUT_DIR: ${{ inputs.output_dir }}
+        EVENT_NAME: ${{ github.event_name }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
       run: |
-        SCAN_FILE="${{ runner.temp }}/vu1nz-scan.json"
-        if [ ! -s "$SCAN_FILE" ]; then
+        if [ ! -s "$RUNNER_TEMP/vu1nz-scan.json" ]; then
           echo "No scan output to report"
           exit 0
         fi
-
-        # Build the POST body: include license_key, repository, ref,
-        # commit_sha, pr_number, findings_count, counts, findings.
-        PR_NUMBER=""
-        if [ "${{ github.event_name }}" = "pull_request" ] || \
-           [ "${{ github.event_name }}" = "pull_request_target" ]; then
-          PR_NUMBER="${{ github.event.pull_request.number }}"
-        fi
-
-        python3 << PYEOF
+        python3 <<'PY'
         import json, os, urllib.request, urllib.error
 
-        with open("$SCAN_FILE") as f:
+        with open(os.environ["RUNNER_TEMP"] + "/vu1nz-scan.json") as f:
             data = json.load(f)
-
         findings = data.get("findings", []) or []
         counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
         for f in findings:
             sev = (f.get("severity") or "").lower()
             if sev in counts:
                 counts[sev] += 1
+        findings = findings[:1000]
 
-        # Trim very large findings so we don't blow the API's 2k cap.
-        if len(findings) > 1000:
-            findings = findings[:1000]
-
-        pr = "${PR_NUMBER}"
         body = {
-            "license_key": "${{ steps.subscription.outputs.license_key }}",
-            "repository": "${{ github.repository }}",
-            "ref": "${{ github.ref }}",
-            "commit_sha": "${{ github.sha }}",
+            "license_key": os.environ["LICENSE_KEY"],
+            "repository": os.environ["GITHUB_REPOSITORY"],
+            "ref": os.environ.get("GITHUB_REF", ""),
+            "commit_sha": os.environ.get("GITHUB_SHA", ""),
             "findings_count": len(findings),
             "counts": counts,
             "findings": findings,
         }
-        if pr:
+        if os.environ.get("EVENT_NAME") in ("pull_request", "pull_request_target"):
             try:
-                body["pr_number"] = int(pr)
+                body["pr_number"] = int(os.environ.get("PR_NUMBER", ""))
             except ValueError:
                 pass
-
-        # Pull AI summary if present
-        ai_path = "${{ inputs.output_dir }}/ai_summary.txt"
+        ai_path = os.path.join(os.environ.get("OUTPUT_DIR", ""), "ai_summary.txt")
         if os.path.exists(ai_path):
             try:
                 with open(ai_path) as f:
@@ -435,9 +423,8 @@ else:
             except Exception:
                 pass
 
-        url = "${{ inputs.api_url }}/api/gh/webhook"
         req = urllib.request.Request(
-            url,
+            os.environ["API_URL"] + "/api/gh/webhook",
             data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -447,8 +434,7 @@ else:
                 resp = json.loads(r.read().decode() or "{}")
                 print(f"::notice::Reported {body['findings_count']} findings to vu1nz cloud (run_id={resp.get('run_id', '?')})")
         except urllib.error.HTTPError as e:
-            err_body = e.read().decode("utf-8", errors="replace")[:200]
-            print(f"::warning::Failed to report to vu1nz cloud ({e.code}): {err_body}")
+            print(f"::warning::Failed to report to vu1nz cloud ({e.code}): {e.read().decode('utf-8', errors='replace')[:200]}")
         except Exception as e:
             print(f"::warning::Failed to report to vu1nz cloud: {e}")
-        PYEOF
+        PY
