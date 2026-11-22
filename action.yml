@@ -108,6 +108,9 @@ runs:
       run: |
         if python3 -c "from vu1nz.cli import app" 2>/dev/null; then
           echo "vu1nz already installed, skipping"
+        elif [ -z "$ACTION_REPO" ]; then
+          # A local `uses: ./...` (this repo's own dogfood run): install the checkout.
+          pip install --quiet "$GITHUB_WORKSPACE"
         else
           REF="${ACTION_REF:-main}"
           pip install --quiet \
